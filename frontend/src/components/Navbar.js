@@ -9,7 +9,7 @@ const Navbar = ({ currentView, setCurrentView }) => {
       
       // Create download link for the file in assets folder
       const link = document.createElement('a');
-      link.href = '/assets/best_denoiser2.h5';  // Path to file in public/assets/
+      link.href = '/assets/best_denoiser2.h5';
       link.download = 'best_denoiser2.h5';
       link.style.display = 'none';
       
@@ -35,10 +35,10 @@ const Navbar = ({ currentView, setCurrentView }) => {
   };
 
   const glassButtonStyle = {
-    padding: '1rem 1.5rem',
+    padding: '0.875rem 1.25rem',
     border: '1px solid rgba(255, 255, 255, 0.18)',
     borderRadius: '12px',
-    fontSize: '1rem',
+    fontSize: '0.875rem',
     fontWeight: '500',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
@@ -49,31 +49,40 @@ const Navbar = ({ currentView, setCurrentView }) => {
     WebkitBackdropFilter: 'blur(10px)',
     boxShadow: '0 8px 32px 0 rgba(31, 38, 135, 0.37)',
     color: '#374151',
-    marginBottom: '1rem'
+    marginBottom: '0.75rem',
+    minHeight: '48px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden'
   };
 
   const activeButtonStyle = {
     ...glassButtonStyle,
     background: 'rgba(59, 130, 246, 0.3)',
     border: '1px solid rgba(59, 130, 246, 0.5)',
-    color: '#1e40af'
+    color: '#1e40af',
+    fontWeight: '600'
   };
 
   return (
     <nav style={{
       position: 'fixed',
-      left: '2rem',
-      top: '2rem',
-      zIndex: 1000
+      left: '1.5rem',
+      top: '1.5rem',
+      zIndex: 1000,
+      minWidth: '220px',
+      maxWidth: '250px'
     }}>
       <div style={{
         display: 'flex',
         flexDirection: 'column',
-        width: '250px',
-        padding: '2rem',
+        width: '100%',
+        padding: '1.5rem',
         background: 'rgba(255, 255, 255, 0.25)',
-        backdropFilter: 'blur(10px)',
-        WebkitBackdropFilter: 'blur(10px)',
+        backdropFilter: 'blur(15px)',
+        WebkitBackdropFilter: 'blur(15px)',
         border: '1px solid rgba(255, 255, 255, 0.18)',
         boxShadow: '0 8px 32px 0 rgba(31, 38, 135, 0.37)',
         borderRadius: '16px'
@@ -85,7 +94,7 @@ const Navbar = ({ currentView, setCurrentView }) => {
             if (currentView !== 'try-model') {
               e.target.style.background = 'rgba(255, 255, 255, 0.35)';
               e.target.style.border = '1px solid rgba(255, 255, 255, 0.3)';
-              e.target.style.transform = 'translateX(5px)';
+              e.target.style.transform = 'translateX(3px)';
               e.target.style.boxShadow = '0 8px 25px rgba(0, 0, 0, 0.15)';
             }
           }}
@@ -107,7 +116,7 @@ const Navbar = ({ currentView, setCurrentView }) => {
           onMouseEnter={(e) => {
             e.target.style.background = 'rgba(255, 255, 255, 0.35)';
             e.target.style.border = '1px solid rgba(255, 255, 255, 0.3)';
-            e.target.style.transform = 'translateX(5px)';
+            e.target.style.transform = 'translateX(3px)';
             e.target.style.boxShadow = '0 8px 25px rgba(0, 0, 0, 0.15)';
           }}
           onMouseLeave={(e) => {
@@ -123,7 +132,7 @@ const Navbar = ({ currentView, setCurrentView }) => {
         <button 
           style={{ 
             ...glassButtonStyle,
-            marginBottom: '0', // Remove margin from last button
+            marginBottom: '0',
             opacity: downloadLoading ? 0.6 : 1,
             cursor: downloadLoading ? 'not-allowed' : 'pointer'
           }}
@@ -133,7 +142,7 @@ const Navbar = ({ currentView, setCurrentView }) => {
             if (!downloadLoading) {
               e.target.style.background = 'rgba(255, 255, 255, 0.35)';
               e.target.style.border = '1px solid rgba(255, 255, 255, 0.3)';
-              e.target.style.transform = 'translateX(5px)';
+              e.target.style.transform = 'translateX(3px)';
               e.target.style.boxShadow = '0 8px 25px rgba(0, 0, 0, 0.15)';
             }
           }}
