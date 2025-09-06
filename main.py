@@ -17,18 +17,42 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Image Denoising API (ONNX)", version="1.0.0")
 
-# Configure CORS
-origins = [
-    "*"
-]
-
+# Configure CORS - Allow ALL origins, methods, and headers
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Set to False when using allow_origins=["*"]
+    allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers to the client
 )
+
+# Alternative more explicit configuration (choose one or the other)
+"""
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost:8080",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000", 
+        "http://127.0.0.1:8080",
+        "https://localhost:3000",
+        "https://localhost:8000",
+        "https://localhost:8080",
+        "https://*.onrender.com",
+        "https://*.netlify.app",
+        "https://*.vercel.app",
+        "https://*.github.io"
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+"""
 
 # Global variables
 MODEL_PATH = "denoiser.onnx"
@@ -144,12 +168,26 @@ async def startup_event():
     """Load ONNX model on startup"""
     logger.info("🚀 Starting FastAPI Image Denoising API (ONNX)...")
     logger.info(f"ONNX Runtime version: {ort.__version__}")
+    logger.info("🌐 CORS configured to allow ALL origins")
     
     success = load_onnx_model()
     if not success:
         logger.error("❌ Failed to load ONNX model")
     else:
         logger.info("🎉 ONNX model loaded successfully! API ready for denoising.")
+
+# ---------- CORS Test Endpoint ----------
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Handle preflight OPTIONS requests for CORS"""
+    return JSONResponse(
+        content={},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 # ---------- Endpoints ----------
 @app.get("/")
@@ -158,6 +196,7 @@ async def root():
     return {
         "message": "🎯 Image Denoising API (ONNX)",
         "status": "running",
+        "cors_enabled": "✅ All origins allowed",
         "model_loaded": ort_session is not None,
         "model_type": "ONNX",
         "onnx_version": ort.__version__,
@@ -177,6 +216,7 @@ async def health_check():
         "status": "🟢 healthy" if ort_session is not None else "🟡 degraded",
         "model_loaded": ort_session is not None,
         "model_file_exists": os.path.exists(MODEL_PATH),
+        "cors_status": "✅ All origins allowed",
         "onnx_providers": ort_session.get_providers() if ort_session else [],
     }
 
@@ -314,3 +354,8 @@ async def get_model_info():
         logger.error(f"Error getting model info: {e}")
         raise HTTPException(status_code=500, detail=f"Could not retrieve model info: {str(e)}")
 
+# Run the application
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
