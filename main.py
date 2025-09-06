@@ -1,295 +1,242 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
-import tensorflow as tf
+import onnxruntime as ort
 from PIL import Image
 import io
 import base64
 import os
 from typing import Dict, Any
 import logging
-
-# Configure TensorFlow to use CPU only (works with TF 2.19.0)
-os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-tf.config.set_visible_devices([], 'GPU')
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Image Denoising API", version="1.0.0")
+app = FastAPI(title="Image Denoising API (ONNX)", version="1.0.0")
+
+# Configure CORS
+origins = [
+    "http://localhost:3000", "http://localhost:8000", "http://localhost:8080",
+    "http://127.0.0.1:3000", "http://127.0.0.1:8000", "http://127.0.0.1:8080",
+    "https://localhost:3000", "https://localhost:8000", "https://localhost:8080",
+    "*"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Global variables
-MODEL_PATH = "best_denoiser2.h5"
+MODEL_PATH = "denoiser.onnx"
 IMG_SIZE = 512
-model = None
+ort_session = None
 
-def psnr_metric(y_true, y_pred):
-    """PSNR metric function"""
-    return tf.image.psnr(y_true, y_pred, max_val=1.0)
-
-def ssim_metric(y_true, y_pred):
-    """SSIM metric function"""
-    return tf.image.ssim(y_true, y_pred, max_val=1.0)
-
-def load_model():
-    """Load the trained denoising model from .h5 file"""
-    global model
-    try:
-        if not os.path.exists(MODEL_PATH):
-            logger.error(f"Model file not found at {MODEL_PATH}")
-            return False
-        
-        logger.info(f"Loading model from {MODEL_PATH}...")
-        logger.info(f"TensorFlow version: {tf.__version__}")
-        logger.info(f"NumPy version: {np.__version__}")
-        
-        # Direct loading approach (works best with TF 2.19.0)
-        try:
-            model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-            
-            # Recompile with current TensorFlow version
-            model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-                loss='mse',
-                metrics=[psnr_metric, ssim_metric]
-            )
-            
-            logger.info("✅ Successfully loaded model")
-            
-        except Exception as e:
-            logger.error(f"Direct loading failed: {e}")
-            
-            # Fallback: Create simple denoising architecture
-            logger.info("Creating fallback denoising model...")
-            
-            inputs = tf.keras.layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
-            
-            # Simple U-Net style architecture
-            # Encoder
-            conv1 = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(inputs)
-            conv1 = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(conv1)
-            pool1 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv1)
-            
-            conv2 = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(pool1)
-            conv2 = tf.keras.layers.Conv2D(128, 3, padding='same', activation='relu')(conv2)
-            
-            # Decoder
-            up1 = tf.keras.layers.UpSampling2D(size=(2, 2))(conv2)
-            merge1 = tf.keras.layers.concatenate([conv1, up1], axis=3)
-            conv3 = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(merge1)
-            conv3 = tf.keras.layers.Conv2D(64, 3, padding='same', activation='relu')(conv3)
-            
-            # Output layer
-            outputs = tf.keras.layers.Conv2D(1, 1, activation='sigmoid')(conv3)
-            
-            model = tf.keras.Model(inputs, outputs)
-            model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-                loss='mse',
-                metrics=[psnr_metric, ssim_metric]
-            )
-            
-            logger.warning("⚠️ Using fallback U-Net model (no pre-trained weights)")
-        
-        logger.info(f"Model input shape: {model.input_shape}")
-        logger.info(f"Model output shape: {model.output_shape}")
-        logger.info(f"Total parameters: {model.count_params():,}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error loading model: {str(e)}")
-        return False
-
+# ---------- Metrics ----------
 def iqi_metric(y_true, y_pred, eps=1e-8):
     """Image Quality Index (IQI) metric"""
     x = y_true.astype(np.float32)
     y = y_pred.astype(np.float32)
-    x_mu = x.mean()
-    y_mu = y.mean()
-    x_var = x.var()
-    y_var = y.var()
+    x_mu, y_mu = x.mean(), y.mean()
+    x_var, y_var = x.var(), y.var()
     xy_cov = ((x - x_mu) * (y - y_mu)).mean()
     num = (2 * x_mu * y_mu + eps) * (2 * xy_cov + eps)
     den = (x_mu**2 + y_mu**2 + eps) * (x_var + y_var + eps)
     return float(num / (den + eps))
 
-def preprocess_image(image_bytes: bytes) -> np.ndarray:
-    """Preprocess uploaded image to model input format"""
+# ---------- Model Loading ----------
+def load_onnx_model():
+    """Load ONNX model"""
+    global ort_session
     try:
-        image = Image.open(io.BytesIO(image_bytes))
+        if not os.path.exists(MODEL_PATH):
+            logger.error(f"ONNX model file not found at {MODEL_PATH}")
+            return False
         
-        # Convert to grayscale if not already
-        if image.mode != 'L':
-            image = image.convert('L')
+        logger.info(f"Loading ONNX model from {MODEL_PATH}...")
         
-        # Resize using Pillow
-        if image.size != (IMG_SIZE, IMG_SIZE):
-            image = image.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
+        # Create ONNX Runtime session
+        providers = ['CPUExecutionProvider']
         
-        # Convert to numpy array and normalize
-        img_array = np.array(image, dtype=np.float32) / 255.0
+        # Try to use GPU if available
+        if ort.get_device() == 'GPU':
+            providers.insert(0, 'CUDAExecutionProvider')
+        
+        ort_session = ort.InferenceSession(MODEL_PATH, providers=providers)
+        
+        # Get model info
+        input_info = ort_session.get_inputs()[0]
+        output_info = ort_session.get_outputs()[0]
+        
+        logger.info("✅ Successfully loaded ONNX model")
+        logger.info(f"Input: {input_info.name} - {input_info.shape} - {input_info.type}")
+        logger.info(f"Output: {output_info.name} - {output_info.shape} - {output_info.type}")
+        logger.info(f"Providers: {ort_session.get_providers()}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error loading ONNX model: {e}")
+        return False
+
+# ---------- Utils ----------
+def preprocess_image(image_bytes: bytes) -> (np.ndarray, tuple):
+    """Preprocess image for ONNX model input"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("L")
+        original_size = image.size
+        image_resized = image.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
+        img_array = np.array(image_resized, dtype=np.float32) / 255.0
         img_array = np.clip(img_array, 0.0, 1.0)
-        return img_array
-        
+        return img_array, original_size
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
 
+def resize_back(img_array: np.ndarray, size: tuple) -> np.ndarray:
+    """Resize image back to original size"""
+    img_8bit = (img_array * 255).astype(np.uint8)
+    img_pil = Image.fromarray(img_8bit, mode="L").resize(size, Image.LANCZOS)
+    return np.array(img_pil, dtype=np.float32) / 255.0
+
 def add_gaussian_noise(img: np.ndarray, sigma_range=(10, 35)) -> np.ndarray:
     """Add Gaussian noise to image"""
-    sigma_255 = np.random.uniform(*sigma_range)
-    sigma = sigma_255 / 255.0
+    sigma = np.random.uniform(*sigma_range) / 255.0
     noise = np.random.normal(0.0, sigma, img.shape).astype(np.float32)
-    noisy = np.clip(img + noise, 0.0, 1.0)
-    return noisy
+    return np.clip(img + noise, 0.0, 1.0)
 
 def array_to_base64(img_array: np.ndarray) -> str:
-    """Convert numpy array to base64 encoded image"""
+    """Convert numpy array to base64 string"""
     img_8bit = (img_array * 255).astype(np.uint8)
-    img_pil = Image.fromarray(img_8bit, mode='L')
-    
+    img_pil = Image.fromarray(img_8bit, mode="L")
     buffered = io.BytesIO()
     img_pil.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    return img_base64
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+def run_onnx_inference(image_array: np.ndarray) -> np.ndarray:
+    """Run inference using ONNX model"""
+    try:
+        # ONNX expects NHWC format: (batch_size, height, width, channels)
+        model_input = image_array[None, ..., None].astype(np.float32)
+        
+        # Get input name
+        input_name = ort_session.get_inputs()[0].name
+        
+        # Run inference
+        inputs = {input_name: model_input}
+        outputs = ort_session.run(None, inputs)
+        
+        # Extract output and clip values
+        denoised_output = outputs[0]
+        denoised_image = np.clip(denoised_output[0, ..., 0], 0.0, 1.0)
+        
+        return denoised_image
+        
+    except Exception as e:
+        logger.error(f"ONNX inference error: {e}")
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+
+# ---------- Events ----------
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup"""
-    logger.info("🚀 Starting FastAPI Image Denoising API...")
-    logger.info(f"Environment: Google Colab")
-    logger.info(f"TensorFlow: {tf.__version__}")
-    logger.info(f"NumPy: {np.__version__}")
-    logger.info(f"Pillow: {Image.__version__}")
-    logger.info(f"Model path: {MODEL_PATH}")
-    logger.info(f"Working directory: {os.getcwd()}")
+    """Load ONNX model on startup"""
+    logger.info("🚀 Starting FastAPI Image Denoising API (ONNX)...")
+    logger.info(f"ONNX Runtime version: {ort.__version__}")
     
-    if not os.path.exists(MODEL_PATH):
-        logger.warning(f"⚠️ Model file not found at: {MODEL_PATH}")
-        logger.info("API will start with fallback model")
-    
-    success = load_model()
+    success = load_onnx_model()
     if not success:
-        logger.error("❌ Failed to load model")
+        logger.error("❌ Failed to load ONNX model")
     else:
-        logger.info("🎉 Model loaded successfully! API ready for denoising.")
+        logger.info("🎉 ONNX model loaded successfully! API ready for denoising.")
 
+# ---------- Endpoints ----------
 @app.get("/")
 async def root():
-    """Root endpoint with environment info"""
+    """Root endpoint with API information"""
     return {
-        "message": "🎯 Image Denoising API",
+        "message": "🎯 Image Denoising API (ONNX)",
         "status": "running",
-        "environment": "Google Colab Compatible",
-        "model_loaded": model is not None,
-        "versions": {
-            "tensorflow": tf.__version__,
-            "numpy": np.__version__,
-            "pillow": Image.__version__,
-            "fastapi": "0.116.1"
-        },
+        "model_loaded": ort_session is not None,
+        "model_type": "ONNX",
+        "onnx_version": ort.__version__,
+        "providers": ort_session.get_providers() if ort_session else [],
         "endpoints": {
-            "denoise": "POST /denoise - Upload image for denoising",
-            "denoise_existing": "POST /denoise-existing - Denoise already noisy image",
-            "health": "GET /health - Health check",
-            "model_info": "GET /model-info - Model details"
-        }
+            "denoise": "POST /denoise",
+            "denoise_existing": "POST /denoise-existing", 
+            "health": "GET /health",
+            "model_info": "GET /model-info",
+        },
     }
 
 @app.get("/health")
 async def health_check():
-    """Comprehensive health check"""
-    model_loaded = model is not None
-    model_exists = os.path.exists(MODEL_PATH)
-    
+    """Health check endpoint"""
     return {
-        "status": "🟢 healthy" if model_loaded else "🟡 degraded",
-        "model_loaded": model_loaded,
-        "model_file_exists": model_exists,
-        "working_directory": os.getcwd(),
-        "available_models": [f for f in os.listdir(".") if f.endswith(('.h5', '.keras', '.pb'))],
-        "system_info": {
-            "tensorflow": tf.__version__,
-            "numpy": np.__version__,
-            "gpu_available": len(tf.config.list_physical_devices('GPU')) > 0,
-            "gpu_enabled": False  # We're forcing CPU usage
-        }
+        "status": "🟢 healthy" if ort_session is not None else "🟡 degraded",
+        "model_loaded": ort_session is not None,
+        "model_file_exists": os.path.exists(MODEL_PATH),
+        "onnx_providers": ort_session.get_providers() if ort_session else [],
     }
 
 @app.post("/denoise")
 async def denoise_image(file: UploadFile = File(...)) -> Dict[str, Any]:
     """Denoise an uploaded image with added noise simulation"""
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Check server logs."
-        )
+    if ort_session is None:
+        raise HTTPException(status_code=503, detail="ONNX model not loaded")
     
-    if not file.content_type.startswith('image/'):
-        raise HTTPException(
-            status_code=400,
-            detail="File must be an image (PNG, JPEG, etc.)"
-        )
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
     
     try:
-        # Process image
         logger.info(f"📷 Processing: {file.filename}")
         image_bytes = await file.read()
-        clean_image = preprocess_image(image_bytes)
+        clean_image, original_size = preprocess_image(image_bytes)
         
         # Add noise for simulation
         noisy_image = add_gaussian_noise(clean_image)
         
-        # Prepare for model
-        model_input = noisy_image[None, ..., None]
+        # Run ONNX inference
+        logger.info("🧠 Running ONNX inference...")
+        denoised_image = run_onnx_inference(noisy_image)
         
-        # Run denoising
-        logger.info("🧠 Running inference...")
-        with tf.device('/CPU:0'):
-            denoised_output = model.predict(model_input, verbose=0)
+        # Resize back to original size
+        clean_resized = resize_back(clean_image, original_size)
+        noisy_resized = resize_back(noisy_image, original_size)
+        denoised_resized = resize_back(denoised_image, original_size)
         
-        denoised_image = np.clip(denoised_output[0, ..., 0], 0.0, 1.0)
-        
-        # Calculate metrics
+        # Calculate metrics using scikit-image
         logger.info("📊 Calculating metrics...")
-        clean_tensor = tf.convert_to_tensor(clean_image[..., None])
-        denoised_tensor = tf.convert_to_tensor(denoised_image[..., None])
-        
-        psnr_value = float(tf.image.psnr(clean_tensor, denoised_tensor, max_val=1.0).numpy())
-        ssim_value = float(tf.image.ssim(clean_tensor, denoised_tensor, max_val=1.0).numpy())
+        psnr_value = peak_signal_noise_ratio(clean_image, denoised_image, data_range=1.0)
+        ssim_value = structural_similarity(clean_image, denoised_image, data_range=1.0)
         iqi_value = iqi_metric(clean_image, denoised_image)
         
-        # Convert to base64
-        original_b64 = array_to_base64(clean_image)
-        noisy_b64 = array_to_base64(noisy_image)
-        denoised_b64 = array_to_base64(denoised_image)
-        
-        response = {
+        return {
             "status": "✅ success",
-            "message": "Image successfully denoised",
+            "message": "Image successfully denoised with ONNX model",
             "images": {
-                "original": f"data:image/png;base64,{original_b64}",
-                "noisy": f"data:image/png;base64,{noisy_b64}",
-                "denoised": f"data:image/png;base64,{denoised_b64}"
+                "original": f"data:image/png;base64,{array_to_base64(clean_resized)}",
+                "noisy": f"data:image/png;base64,{array_to_base64(noisy_resized)}",
+                "denoised": f"data:image/png;base64,{array_to_base64(denoised_resized)}",
             },
             "metrics": {
                 "psnr": round(psnr_value, 4),
                 "ssim": round(ssim_value, 4),
-                "iqi": round(iqi_value, 4)
+                "iqi": round(iqi_value, 4),
             },
             "processing_info": {
                 "filename": file.filename,
-                "input_size": list(clean_image.shape),
+                "input_size": list(original_size),
                 "processed_size": [IMG_SIZE, IMG_SIZE],
                 "noise_added": "Gaussian (σ=10-35)",
-                "model_type": "CNN Denoiser"
+                "model_type": "ONNX",
+                "providers": ort_session.get_providers()
             }
         }
-        
-        logger.info(f"✅ Success! PSNR: {psnr_value:.2f}, SSIM: {ssim_value:.3f}")
-        return response
         
     except Exception as e:
         logger.error(f"❌ Error: {str(e)}")
@@ -298,39 +245,36 @@ async def denoise_image(file: UploadFile = File(...)) -> Dict[str, Any]:
 @app.post("/denoise-existing")
 async def denoise_existing_image(file: UploadFile = File(...)) -> Dict[str, Any]:
     """Denoise an already noisy image without adding more noise"""
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    if ort_session is None:
+        raise HTTPException(status_code=503, detail="ONNX model not loaded")
     
-    if not file.content_type.startswith('image/'):
+    if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
     
     try:
         logger.info(f"📷 Denoising existing noisy image: {file.filename}")
         image_bytes = await file.read()
-        noisy_image = preprocess_image(image_bytes)
+        noisy_image, original_size = preprocess_image(image_bytes)
         
-        # Direct denoising without adding noise
-        model_input = noisy_image[None, ..., None]
+        # Run ONNX inference directly
+        denoised_image = run_onnx_inference(noisy_image)
         
-        with tf.device('/CPU:0'):
-            denoised_output = model.predict(model_input, verbose=0)
-        
-        denoised_image = np.clip(denoised_output[0, ..., 0], 0.0, 1.0)
-        
-        # Convert to base64
-        noisy_b64 = array_to_base64(noisy_image)
-        denoised_b64 = array_to_base64(denoised_image)
+        # Resize back to original size
+        noisy_resized = resize_back(noisy_image, original_size)
+        denoised_resized = resize_back(denoised_image, original_size)
         
         return {
             "status": "✅ success",
-            "message": "Existing noisy image denoised",
+            "message": "Existing noisy image denoised with ONNX model",
             "images": {
-                "input_noisy": f"data:image/png;base64,{noisy_b64}",
-                "denoised": f"data:image/png;base64,{denoised_b64}"
+                "input_noisy": f"data:image/png;base64,{array_to_base64(noisy_resized)}",
+                "denoised": f"data:image/png;base64,{array_to_base64(denoised_resized)}",
             },
             "processing_info": {
                 "filename": file.filename,
-                "note": "No additional noise added"
+                "note": "No additional noise added",
+                "model_type": "ONNX",
+                "providers": ort_session.get_providers()
             }
         }
         
@@ -340,27 +284,36 @@ async def denoise_existing_image(file: UploadFile = File(...)) -> Dict[str, Any]
 
 @app.get("/model-info")
 async def get_model_info():
-    """Get detailed model information"""
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    """Get detailed ONNX model information"""
+    if ort_session is None:
+        raise HTTPException(status_code=503, detail="ONNX model not loaded")
     
-    return {
-        "model_name": getattr(model, 'name', 'Image_Denoiser'),
-        "architecture": {
-            "input_shape": model.input_shape,
-            "output_shape": model.output_shape,
-            "total_parameters": f"{model.count_params():,}",
-            "layers": len(model.layers)
-        },
-        "file_info": {
-            "path": MODEL_PATH,
-            "size_mb": round(os.path.getsize(MODEL_PATH) / 1024 / 1024, 2) if os.path.exists(MODEL_PATH) else "N/A"
-        },
-        "environment": {
-            "tensorflow": tf.__version__,
-            "numpy": np.__version__,
-            "device": "CPU (forced)",
-            "compatible_with": "Google Colab"
+    try:
+        input_info = ort_session.get_inputs()[0]
+        output_info = ort_session.get_outputs()[0]
+        
+        return {
+            "model_name": "Dual-Branch Denoiser (ONNX)",
+            "model_type": "ONNX Runtime",
+            "onnx_version": ort.__version__,
+            "input_info": {
+                "name": input_info.name,
+                "shape": input_info.shape,
+                "type": input_info.type
+            },
+            "output_info": {
+                "name": output_info.name,
+                "shape": output_info.shape,
+                "type": output_info.type
+            },
+            "providers": ort_session.get_providers(),
+            "file_info": {
+                "path": MODEL_PATH,
+                "size_mb": round(os.path.getsize(MODEL_PATH) / (1024 * 1024), 2) if os.path.exists(MODEL_PATH) else "N/A"
+            }
         }
-    }
+        
+    except Exception as e:
+        logger.error(f"Error getting model info: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not retrieve model info: {str(e)}")
 
